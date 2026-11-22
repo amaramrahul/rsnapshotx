@@ -1,0 +1,867 @@
+#!/bin/bash
+# rsnapshotx - rsnapshot that retries requested levels, for hosts that are not always online
+#
+# A wrapper around rsnapshot. cron requests each retain level (e.g. daily once a day, weekly once
+# a week, monthly once a month) and runs "retry" often (e.g. hourly), so that every requested
+# level eventually runs:
+#   - a requested level is recorded as pending and stays pending until it succeeds; a failed level
+#     is run again by the next retry
+#   - the first retain level syncs first (sync_first) and needs every ssh source to be online;
+#     while a host is offline the level stays pending, without an error
+#   - a higher level waits until the oldest snapshot of the level below exists (e.g. daily.6 for
+#     "retain daily 7"); rotating it earlier would only shift the level and drop its oldest
+#     snapshot
+#   - pending levels run highest first, so each takes the oldest lower snapshot before it is
+#     rotated out
+# Several configs (-c, repeatable) run one after the other. Each is read and checked when its turn
+# comes, so a broken config or an unmounted backup disk fails only that config; the run then
+# exits 1. Each config has its own lock: a config that another run holds is skipped, and its
+# requested levels stay pending.
+# Running it under chronic (moreutils) makes cron mail only failures (a non-zero exit); the output
+# of a successful run, warnings included, is not mailed.
+#
+# Example /etc/cron.d entries:
+#   15 23 * * *  root  chronic rsnapshotx -c /etc/rsnapshot/laptop.conf daily
+#   30 22 * * 0  root  chronic rsnapshotx -c /etc/rsnapshot/laptop.conf weekly
+#   45 21 1 * *  root  chronic rsnapshotx -c /etc/rsnapshot/laptop.conf monthly
+#   5  *  * * *  root  chronic rsnapshotx -c /etc/rsnapshot/laptop.conf retry
+#
+# Usage:
+#   rsnapshotx [options] [-c cfgfile]... command [args]
+#     command:
+#       <level>                   a retain level of the config: request it, then run everything
+#                                 pending
+#       retry                     run everything pending
+#       any other                 for a config without such a level: run by rsnapshot with its
+#                                 args (configtest, du, diff, ...)
+#     rsnapshot options, passed to rsnapshot:
+#       -c cfgfile                config file, repeatable [/etc/rsnapshot.conf]
+#       -t                        test: only show what rsnapshot would do, and write no state
+#       -v, -V, -q, -D, -x        verbose, more verbose, quiet, debug, one file system
+#                                 (they can be bundled, as with rsnapshot: -tv, -c/path)
+#     options:
+#       --trace                   show every command (set -x)
+#       --email                   mail the status of each config that ran something, and of the
+#                                 whole run at its end when several configs were given
+#       --to addr                 recipient of --email [root]
+#       --from addr               sender of --email [that of the mail command]
+#       --relayhost host:port     send --email with msmtp through this SMTP server (no TLS, no
+#                                 auth) instead of the mail command, e.g. from a container
+#   rsnapshotx --start-ssh-agent [ssh-add args]
+#                                 start a long-lived ssh-agent and load keys into it with ssh-add
+#                                 (interactive; without args: ssh-add's default keys; ssh-add
+#                                 options go after --, e.g. -- -t 8h ~/.ssh/key)
+#   rsnapshotx --stop-ssh-agent   stop that ssh-agent
+#   rsnapshotx --help
+#
+# Requirements: root, bash >= 5, GNU coreutils, util-linux (flock), rsnapshot. Each config needs
+# "sync_first 1", a "lockfile", and a snapshot_root that exists (create it once): the state is kept
+# there, and a missing root (e.g. an unmounted backup disk) fails the config. "no_create_root 1" is
+# recommended, so that rsnapshot run by hand fails the same way instead of filling /. The
+# directories of lockfile and logfile are created when missing (e.g. /var/run/rsnapshot after a
+# reboot, as /run is a tmpfs). rsnapshot's exit code 2 (warnings only, e.g. files that vanished
+# during the sync) counts as success, with a warning, as rsnapshot recommends. Levels are the config's retain lines (include_conf files too), in order. A host is
+# online when ssh can log in to every ssh source of the config ([user@]host:path, as rsnapshot
+# defines them) without a prompt and without running a command, using cmd_ssh and the ssh_args
+# rsnapshot would use. A refused login (key or host key) is an error; any other failure means
+# offline. A config with only local sources is always online. While the socket of
+# --start-ssh-agent (/run/rsnapshot/rsnapshotx.agent.sock) exists, ssh uses that agent (overriding
+# SSH_AUTH_SOCK), and a sync of ssh sources fails if the agent has no key; otherwise ssh uses
+# whatever the environment or the ssh config provides.
+#
+# Files:
+#   <snapshot_root>/.rsnapshotx-<level>        state of a level: pending, failed or ok, and when
+#   <lockfile dir>/rsnapshotx.<lockfile name>  lock of a config; holds the pid of the run holding it
+#   logfile of the config                      the wrapper adds its lines, in rsnapshot's format
+#   /run/rsnapshot/rsnapshotx.agent.sock, .pid ssh-agent of --start-ssh-agent
+#
+# Settings, from the environment [default]:
+#   ONLINE_TIMEOUT_SECS      connect timeout of the online check (ssh ConnectTimeout) [10]
+#
+# Exit codes: 0 ok (levels still waiting or offline included), 1 a config failed, the arguments
+# were wrong or a --email mail could not be sent.
+set -euo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+ONLINE_TIMEOUT_SECS=${ONLINE_TIMEOUT_SECS:-10}
+# Recipient of --email without --to
+DEFAULT_MAIL_TO=root
+# Prefix of the lock and state files, fixed so that they don't depend on how the script is called
+NAME=rsnapshotx
+# Directory of the ssh-agent of --start-ssh-agent, the usual lockfile directory, so that a container
+# that mounts it also gets the agent
+AGENT_DIR=/run/rsnapshot
+AGENT_SOCK=$AGENT_DIR/$NAME.agent.sock
+AGENT_PIDFILE=$AGENT_DIR/$NAME.agent.pid
+DEFAULT_CONF=/etc/rsnapshot.conf
+PROG=${0##*/}
+
+# Prints the header comment
+function usage {
+  sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0"
+}
+
+function die {
+  echo "ERROR: $1" >&2
+  exit 1
+}
+
+## ssh agent management (run manually, interactive)
+
+# Starts the agent unless it runs, then loads keys with ssh-add and the given args. An agent that
+# already has a key is left alone unless keys are given.
+function start_agent {
+  export SSH_AUTH_SOCK=$AGENT_SOCK
+  # ssh-add -l: 0 = key loaded, 1 = agent has no keys, 2 = no agent
+  local rc=0
+  ssh-add -l > /dev/null 2>&1 || rc=$?
+  case $rc in
+    0)
+      echo "ssh-agent already running with a key loaded ($AGENT_SOCK)"
+      if [ $# -eq 0 ]; then
+        return
+      fi
+      ;;
+    2)
+      # Remove any socket left behind by a dead agent
+      rm -f "$AGENT_SOCK" "$AGENT_PIDFILE"
+      mkdir -p "$AGENT_DIR"
+      eval "$(ssh-agent -s -a "$AGENT_SOCK")" > /dev/null
+      echo "$SSH_AGENT_PID" > "$AGENT_PIDFILE"
+      echo "Started ssh-agent (pid $SSH_AGENT_PID, socket $AGENT_SOCK)"
+      ;;
+  esac
+  ssh-add "$@"
+}
+
+function stop_agent {
+  if [ -f "$AGENT_PIDFILE" ]; then
+    local pid
+    pid=$(cat "$AGENT_PIDFILE")
+    kill "$pid" 2> /dev/null || true
+    echo "Stopped ssh-agent (pid $pid)"
+  else
+    echo "No ssh-agent pid file found ($AGENT_PIDFILE)"
+  fi
+  rm -f "$AGENT_SOCK" "$AGENT_PIDFILE"
+}
+
+## Options
+
+trace=false
+dry_run=false
+email=false
+agent_command=
+mail_to=
+mail_from=
+relayhost=
+conf_args=()
+# Passed to every rsnapshot run (-t, -v, ...)
+rsnapshot_args=()
+
+# Echoes the value of an option given as "--opt value" (from $2) or "--opt=value"
+function option_value {
+  local value
+  if [[ "$1" == *=* ]]; then
+    value=${1#*=}
+  else
+    value=${2:-}
+  fi
+  if [ -z "$value" ] || [[ "$value" == --* ]]; then
+    echo "${1%%=*} needs a value" >&2
+    exit 1
+  fi
+  echo "$value"
+}
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    -h | --help) usage; exit 0 ;;
+    --start-ssh-agent | --stop-ssh-agent) agent_command=$1 ;;
+    --trace) trace=true ;;
+    --email) email=true ;;
+    --to | --to=* | --from | --from=* | --relayhost | --relayhost=*)
+      value=$(option_value "$@")
+      case $1 in
+        --to*) mail_to=$value ;;
+        --from*) mail_from=$value ;;
+        --relayhost*) relayhost=$value ;;
+      esac
+      if [[ "$1" != *=* ]]; then
+        shift
+      fi
+      ;;
+    -c)
+      if [ $# -lt 2 ]; then
+        echo "-c needs a config file" >&2
+        exit 1
+      fi
+      conf_args+=("$2")
+      shift
+      ;;
+    -t) dry_run=true; rsnapshot_args+=(-t) ;;
+    -v | -V | -q | -D | -x) rsnapshot_args+=("$1") ;;
+    --) shift; break ;;
+    -[!-]?*)
+      # Bundled short options, as rsnapshot (getopts) takes them: -tv, -c/path, -tc path.
+      # Split into single options and parse them again; an unknown letter ends up in -*).
+      flags=${1#-}
+      shift
+      split=()
+      while [ -n "$flags" ]; do
+        if [ "${flags:0:1}" = c ] && [ ${#flags} -gt 1 ]; then
+          split+=(-c "${flags:1}")
+          flags=
+        else
+          split+=("-${flags:0:1}")
+          flags=${flags:1}
+        fi
+      done
+      set -- "${split[@]}" "$@"
+      continue
+      ;;
+    -*) echo "Unknown option '$1'. See: $PROG --help" >&2; exit 1 ;;
+    *) break ;;
+  esac
+  shift
+done
+if ! $email && [ -n "$mail_to$mail_from$relayhost" ]; then
+  echo "--to, --from and --relayhost need --email" >&2
+  exit 1
+fi
+mail_to=${mail_to:-$DEFAULT_MAIL_TO}
+if [ -n "$relayhost" ] && [[ ! "$relayhost" =~ ^[^:]+:[0-9]+$ ]]; then
+  echo "--relayhost expects host:port, not '$relayhost'" >&2
+  exit 1
+fi
+if [ -z "$agent_command" ] && [ $# -eq 0 ]; then
+  echo "No command given. See: $PROG --help" >&2
+  exit 1
+fi
+
+if [[ $(id -u) -ne 0 ]]; then
+  echo "This script must be run as root" >&2
+  exit 1
+fi
+
+case $agent_command in
+  --start-ssh-agent)
+    start_agent "$@"
+    exit 0
+    ;;
+  --stop-ssh-agent)
+    if [ $# -gt 0 ]; then
+      die "--stop-ssh-agent takes no arguments, got: $*"
+    fi
+    stop_agent
+    exit 0
+    ;;
+esac
+
+command=$1
+shift
+# The agent of --start-ssh-agent is used whenever its socket exists
+use_agent=false
+if [ -S "$AGENT_SOCK" ]; then
+  export SSH_AUTH_SOCK=$AGENT_SOCK
+  use_agent=true
+fi
+
+command_args=("$@")
+if $email; then
+  if [ -n "$relayhost" ] && ! command -v msmtp > /dev/null; then
+    die "--relayhost needs msmtp. Install it first"
+  fi
+  if [ -z "$relayhost" ] && ! command -v mail > /dev/null; then
+    die "--email needs the mail command (mailutils or bsd-mailx), or use --relayhost"
+  fi
+fi
+
+## Configs, in command-line order without duplicates; each is known by its id, the file name
+## without .conf
+
+if [ ${#conf_args[@]} -eq 0 ]; then
+  conf_args=("$DEFAULT_CONF")
+fi
+selected=()
+declare -A conf_of
+for conf in "${conf_args[@]}"; do
+  id=$(basename "$conf" .conf)
+  if [ -n "${conf_of[$id]:-}" ]; then
+    if [ "${conf_of[$id]}" != "$conf" ]; then
+      die "$conf and ${conf_of[$id]} have the same name '$id'"
+    fi
+    continue
+  fi
+  selected+=("$id")
+  conf_of[$id]=$conf
+done
+
+## One config, read and checked when its turn comes. Everything below up to "Running the
+## configs" runs in the config's own subshell, which sets these:
+
+conf=
+id=
+# The config with its include files expanded, and its ssh sources, one per line:
+# [user@]host<TAB>ssh_args (files, so that --trace doesn't print multi-line values)
+expanded=
+sources=
+levels=()
+counts=()
+logfile=
+snapshot_root=
+lock=
+lock_fd=
+cmd_ssh=
+
+function now {
+  date '+%F %T'
+}
+
+# Prints a config with its include_conf files expanded in place, as rsnapshot reads it
+function expanded_conf {
+  # Keep the read loop out of the trace
+  local -
+  set +x
+  local file=$1 depth=${2:-0} line include
+  if [ "$depth" -gt 20 ]; then
+    die "include_conf nested too deeply at $file (include loop?)"
+  fi
+  if [ ! -r "$file" ]; then
+    die "Config $file not found"
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^include_conf$'\t'+(.*)$ ]]; then
+      include=${BASH_REMATCH[1]}
+      if [[ "$include" == \`* ]]; then
+        die "include_conf with a command is not supported ($file)"
+      fi
+      expanded_conf "$include" $((depth + 1))
+    else
+      printf '%s\n' "$line"
+    fi
+  done < "$file"
+}
+
+# Last value of a parameter of the config (fields are separated by one or more tabs)
+function conf_value {
+  awk -F'\t+' -v key="$1" '$1 == key { value = $2 } END { print value }' "$expanded"
+}
+
+# Prints the ssh sources of the config, the way rsnapshot tells them apart: a source is local if
+# it is an existing absolute path, and ssh if it looks like [user@]host:[~.]/path (not a URL like
+# rsync://). Its ssh args are the global ssh_args, replaced by the backup line's ssh_args=... and
+# then extended by its +ssh_args=...
+function ssh_sources {
+  # Keep the read loop out of the trace
+  local -
+  set +x
+  local global key src dest options option_list option args replace extra userhost
+  global=$(conf_value ssh_args)
+  while IFS=$'\t' read -r key src dest options; do
+    if [ "$key" != backup ] || { [[ "$src" == /* ]] && { [ -e "$src" ] || [ -L "$src" ]; }; } ||
+      [[ "$src" == *://* ]] || [[ ! "$src" =~ ^(.*@)?.*:[~.]?/ ]]; then
+      continue
+    fi
+    replace=- extra=
+    IFS=, read -ra option_list <<< "$options"
+    for option in "${option_list[@]}"; do
+      case $option in
+        ssh_args=*) replace=${option#ssh_args=} ;;
+        +ssh_args=*) extra=${option#+ssh_args=} ;;
+      esac
+    done
+    args=$global
+    if [ "$replace" != - ]; then
+      args=$replace
+    fi
+    if [ -n "$extra" ]; then
+      args+=" $extra"
+    fi
+    # rsync's host is everything before the first ":", or an IPv6 address in brackets
+    if [[ "$src" =~ ^([^@]*@)?\[([^]]*)\]: ]]; then
+      userhost=${BASH_REMATCH[1]}${BASH_REMATCH[2]}
+    else
+      userhost=${src%%:*}
+    fi
+    printf '%s\t%s\n' "$userhost" "$args"
+  done < "$expanded" | sort -u
+}
+
+# Reads the config and its retain levels
+function load_config {
+  local level_count
+  conf=$1
+  id=$(basename "$conf" .conf)
+  expanded=$work_dir/$id.conf
+  sources=$work_dir/$id.sources
+  expanded_conf "$conf" > "$expanded"
+  logfile=$(conf_value logfile)
+  for level_count in $(awk -F'\t+' '$1 == "retain" || $1 == "interval" { print $2 ":" $3 }' \
+    "$expanded"); do
+    levels+=("${level_count%%:*}")
+    counts+=("${level_count#*:}")
+  done
+}
+
+# Creates the directories of the config's lockfile and logfile if they are missing, e.g.
+# /var/run/rsnapshot after a reboot (/run is a tmpfs)
+function make_dirs {
+  local param file dir
+  for param in lockfile logfile; do
+    file=$(conf_value "$param")
+    if [ -z "$file" ]; then
+      continue
+    fi
+    dir=$(dirname "$file")
+    mkdir -p -- "$dir" || die "Could not create directory $dir for the $param of $conf"
+  done
+}
+
+function is_level {
+  [[ " ${levels[*]} " == *" $1 "* ]]
+}
+
+# Checks what a level run needs, and sets the config's paths
+function check_config {
+  local i lockfile
+  if [ "$(conf_value sync_first)" != 1 ]; then
+    die "$conf needs 'sync_first 1'"
+  fi
+  if [ ${#levels[@]} -eq 0 ]; then
+    die "$conf has no retain lines"
+  fi
+  for i in "${!levels[@]}"; do
+    if [[ ! "${counts[i]}" =~ ^[1-9][0-9]*$ ]]; then
+      die "Invalid retain '${levels[i]} ${counts[i]}' in $conf"
+    fi
+  done
+  lockfile=$(conf_value lockfile)
+  if [ -z "$lockfile" ]; then
+    die "$conf needs a lockfile"
+  fi
+  lock=$(dirname "$lockfile")/$NAME.$(basename "$lockfile")
+  snapshot_root=$(conf_value snapshot_root)
+  if [ -z "$snapshot_root" ] || [ ! -d "$snapshot_root" ]; then
+    die "snapshot_root '$snapshot_root' of $conf does not exist"
+  fi
+  ssh_sources > "$sources"
+  cmd_ssh=$(conf_value cmd_ssh)
+  if [ -s "$sources" ] && [ -z "$cmd_ssh" ]; then
+    die "$conf needs cmd_ssh for its ssh sources"
+  fi
+}
+
+# Adds a line to the config's rsnapshot logfile, in rsnapshot's format (not in a test run)
+function log {
+  if [ -z "$logfile" ] || $dry_run; then
+    return 0
+  fi
+  echo "[$(date +%Y-%m-%dT%H:%M:%S)] $PROG -c $conf $command: $1" >> "$logfile" ||
+    echo "WARNING: could not write to $logfile" >&2
+}
+
+# Prints a message and logs it
+function say {
+  echo "$1"
+  log "$1"
+}
+
+# rsnapshot for the config, with the rsnapshot options. It doesn't get the lock fd or the copies
+# of the original stdout/stderr, so that a process it leaves behind (e.g. an ssh ControlMaster
+# with ControlPersist) can't keep the lock, or cron's output pipe, open.
+function rsnapshot_config {
+  rsnapshot -c "$conf" "${rsnapshot_args[@]}" "$@" {lock_fd}>&- {out_fd}>&- {err_fd}>&-
+}
+
+# rsnapshot exits 2 when it only had warnings (e.g. files that vanished during the sync), so the
+# step still succeeded: warns, and sets the caller's rc to 0
+function accept_warnings {
+  if [ "$rc" -eq 2 ]; then
+    say "WARNING: rsnapshot $step for $id finished with warnings (rc=2)" >&2
+    rc=0
+  fi
+}
+
+# State file of a level; it holds "pending <time>", "failed <time> rc=N" or "ok <time>"
+function state_file {
+  echo "${snapshot_root%/}/.$NAME-$1"
+}
+
+function state_line {
+  cat "$(state_file "$1")" 2> /dev/null || true
+}
+
+# Returns 0 if the level was requested and has not succeeded since. In a test run the requested
+# level counts as pending, as its request was not written.
+function is_pending {
+  local level=$1 line
+  if $dry_run && [ "$level" = "$command" ]; then
+    return 0
+  fi
+  line=$(state_line "$level")
+  [ -n "$line" ] && [[ "$line" != ok* ]]
+}
+
+# Writes the state of a level, holding a lock on the state file so that a request and the
+# result of a run can't interleave. Given the line read before the run, it writes only if the file
+# still holds it, and returns 1 otherwise: a new request came in during the run, so the level
+# stays pending.
+function write_state {
+  local level=$1 state=$2 file fd rc=0
+  file=$(state_file "$level")
+  if $dry_run; then
+    echo "test run: would write '$state' to $file"
+    return
+  fi
+  exec {fd}>> "$file"
+  flock "$fd"
+  if [ $# -gt 2 ] && [ "$(cat "$file")" != "$3" ]; then
+    echo "$level was requested again during the run, it stays pending"
+    rc=1
+  else
+    echo "$state" > "$file"
+  fi
+  exec {fd}>&-
+  return $rc
+}
+
+# Returns 0 if ssh can log in to every ssh source of the config (always 0 for a config with only
+# local sources). It connects as rsnapshot's rsync would (cmd_ssh, the source's ssh args), in
+# batch mode and without running a command (-N), as a master on its own control socket, which
+# ssh leaves in the background (-f) once logged in and which is then closed. The check's options
+# come first, as ssh uses the first value of an option. A refused login is an error.
+function is_online {
+  local userhost ssh_args rc error
+  local sock=$work_dir/ssh.sock errors=$work_dir/ssh.err
+  while IFS=$'\t' read -r userhost ssh_args; do
+    rc=0
+    # shellcheck disable=SC2086
+    timeout $((ONLINE_TIMEOUT_SECS * 3)) "$cmd_ssh" -o BatchMode=yes \
+      -o ConnectTimeout="$ONLINE_TIMEOUT_SECS" -o ControlMaster=yes -o ControlPath="$sock" \
+      $ssh_args -f -N "$userhost" < /dev/null > /dev/null 2> "$errors" \
+      {lock_fd}>&- {out_fd}>&- {err_fd}>&- || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      "$cmd_ssh" -o ControlPath="$sock" -O exit "$userhost" > /dev/null 2>&1 || true
+      continue
+    fi
+    error=$(tail -n 1 "$errors")
+    if grep -qE 'Permission denied|Host key verification failed|Too many authentication failures' \
+      "$errors"; then
+      die "ssh login to $userhost failed for $conf: $error"
+    fi
+    echo "$id: $userhost is not reachable (${error:-timed out})"
+    return 1
+  done < "$sources"
+}
+
+function check_agent {
+  if ! ssh-add -l > /dev/null 2>&1; then
+    die "No ssh-agent with a key ($AGENT_SOCK). Run: $PROG --start-ssh-agent"
+  fi
+}
+
+# Runs the pending levels of the config. Writes "ok" to the status file once a level has run.
+function backup_config {
+  local status_file=$1 i level line rc step
+
+  # Larger levels first, so each takes the oldest lower snapshot before it is rotated out
+  local due=()
+  for ((i = ${#levels[@]} - 1; i >= 0; i--)); do
+    level=${levels[i]}
+    if ! is_pending "$level"; then
+      continue
+    fi
+    if [ "$i" -gt 0 ]; then
+      local oldest=${levels[i - 1]}.$((counts[i - 1] - 1))
+      if [ ! -d "${snapshot_root%/}/$oldest" ]; then
+        say "$level waits: $oldest not present yet"
+        continue
+      fi
+    else
+      # Only ssh sources need the agent
+      if $use_agent && [ -s "$sources" ]; then
+        check_agent
+      fi
+      if ! is_online; then
+        say "$id is offline, $level stays pending"
+        continue
+      fi
+    fi
+    due+=("$i")
+  done
+  if [ ${#due[@]} -eq 0 ]; then
+    echo "$id: nothing to run"
+    return
+  fi
+  echo "$id due:$(for i in "${due[@]}"; do printf ' %s' "${levels[i]}"; done)"
+
+  rsnapshot_config configtest || die "rsnapshot configtest for $id failed (rc=$?)"
+  for i in "${due[@]}"; do
+    level=${levels[i]}
+    line=$(state_line "$level")
+    rc=0
+    if [ "$i" -eq 0 ]; then
+      step=sync
+      rsnapshot_config sync || rc=$?
+      # A lost connection makes rsnapshot exit 1
+      if [ "$rc" -eq 1 ] && ! is_online; then
+        say "$id went offline during sync, $level stays pending"
+        continue
+      fi
+      accept_warnings
+    fi
+    if [ "$rc" -eq 0 ]; then
+      step=$level
+      rsnapshot_config "$level" || rc=$?
+      accept_warnings
+    fi
+    if [ "$rc" -ne 0 ]; then
+      write_state "$level" "failed $(now) rc=$rc" "$line" || true
+      log "$level failed: rsnapshot $step rc=$rc"
+      die "rsnapshot $step for $id failed (rc=$rc), $level failed"
+    fi
+    echo ok > "$status_file"
+    if write_state "$level" "ok $(now)" "$line"; then
+      say "$level ok"
+    fi
+  done
+}
+
+# Run in the subshell at its end: logs a failure, and clears the pid from the lock it holds
+function config_exit {
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "finished (rc=$rc)"
+  fi
+  if [ -n "$lock_fd" ]; then
+    : > "$lock"
+  fi
+}
+
+# "pid N" of the run holding the lock; other tools may take the lock without writing a pid
+function lock_holder {
+  local pid
+  pid=$(cat "$lock")
+  echo "pid ${pid:-unknown}"
+}
+
+# Does what the command asks for one config, writing what happened to the status file:
+# "passed to rsnapshot", "skipped: ...", "nothing run" or "ok" (a failure is the exit code)
+function process_config {
+  local status_file=$2
+  if $trace; then
+    set -x
+  fi
+  load_config "$1"
+  make_dirs
+
+  if [ "$command" != retry ] && ! is_level "$command"; then
+    echo "passed to rsnapshot" > "$status_file"
+    if [ ${#selected[@]} -gt 1 ]; then
+      echo "== $id =="
+    fi
+    rsnapshot -c "$conf" "${rsnapshot_args[@]}" "$command" "${command_args[@]}" \
+      {out_fd}>&- {err_fd}>&-
+    return
+  fi
+
+  trap config_exit EXIT
+  echo "===== $PROG $id $command $(now) pid $$$($dry_run && echo " (test run)") ====="
+  if [ ${#command_args[@]} -gt 0 ]; then
+    die "$command takes no arguments, got: ${command_args[*]}"
+  fi
+  check_config
+  if [ "$command" != retry ] && ! $dry_run; then
+    write_state "$command" "pending $(now)"
+    log "$command requested"
+  fi
+
+  local fd
+  exec {fd}<> "$lock"
+  if ! flock -n "$fd"; then
+    echo "skipped: locked by another run ($(lock_holder))" > "$status_file"
+    say "$id is locked by another run ($(lock_holder)), skipped; requested levels stay pending"
+    return
+  fi
+  lock_fd=$fd
+  echo $$ > "$lock"
+  echo "nothing run" > "$status_file"
+  backup_config "$status_file"
+}
+
+## Running the configs, each in its own subshell, with its output also going to a file for --email
+
+# The original stdout/stderr, restored after each config
+exec {out_fd}>&1 {err_fd}>&2
+work_dir=$(mktemp -d)
+# The config being run and the pids of its output tee processes; empty while none is (read by
+# clean_up)
+active=
+tee_pids=()
+# Per config: what happened in this run
+declare -A status
+for id in "${selected[@]}"; do
+  status[$id]="not run"
+done
+# Set when a config failed; the run carries on with the next config and exits 1 at the end
+failures=false
+# Set once a config mail was sent
+mailed=false
+# Set when a config mail could not be sent; the run then exits 1 at the end
+mail_failed=false
+
+# Back to the original stdout/stderr; waits for the tee processes so the output file is complete
+function restore_output {
+  exec >&"$out_fd" 2>&"$err_fd"
+  wait "${tee_pids[@]}" 2> /dev/null || true
+  tee_pids=()
+}
+
+function clean_up {
+  local rc=$?
+  set +x
+  if [ -n "$active" ]; then
+    echo "===== $PROG $active finished $(now) rc=$rc ====="
+    status[$active]="FAILED rc=$rc"
+    restore_output
+  fi
+  if $email && [ ${#selected[@]} -gt 1 ] && { $mailed || [ "$rc" -ne 0 ]; }; then
+    send_run_mail "$rc" || rc=1
+  fi
+  rm -rf "$work_dir"
+  exit $rc
+}
+trap clean_up EXIT
+
+# The last 100 lines of this run's output of a config, with "..." lines if some were cut
+function output_tail {
+  local file=$work_dir/$1.out
+  if [ ! -f "$file" ]; then
+    return 0
+  fi
+  if [ "$(wc -l < "$file")" -gt 100 ]; then
+    printf '...\n...\n...\n'
+  fi
+  tail -n 100 "$file"
+}
+
+function send_mail {
+  local subject=$1
+  if $dry_run; then
+    subject+=" (test run)"
+  fi
+  local from_args=()
+  if [ -n "$relayhost" ]; then
+    if [ -n "$mail_from" ]; then
+      from_args=(--from="$mail_from")
+    fi
+    # msmtp sends the message as is, so it needs its headers
+    {
+      if [ -n "$mail_from" ]; then
+        echo "From: $mail_from"
+      fi
+      printf 'To: %s\nSubject: %s\nDate: %s\n\n' "$mail_to" "$subject" "$(date -R)"
+      cat
+    } | msmtp --host="${relayhost%:*}" --port="${relayhost##*:}" --tls=off --auth=off \
+      "${from_args[@]}" -- "$mail_to" ||
+      { echo "WARNING: could not mail '$subject' to $mail_to via $relayhost" >&2; return 1; }
+  else
+    # -r sets the sender (bsd-mailx and mailutils)
+    if [ -n "$mail_from" ]; then
+      from_args=(-r "$mail_from")
+    fi
+    mail -s "$subject" "${from_args[@]}" "$mail_to" ||
+      { echo "WARNING: could not mail '$subject' to $mail_to" >&2; return 1; }
+  fi
+}
+
+# Mails the status of one config and its output from this run
+function send_config_mail {
+  local id=$1 subject
+  case ${status[$id]} in
+    ok) subject="$id backup successful" ;;
+    FAILED*) subject="$id backup failed (${status[$id]#FAILED })" ;;
+    *) subject="$id backup ${status[$id]}" ;;
+  esac
+  mailed=true
+  {
+    echo "$id: ${status[$id]}"
+    output_tail "$id"
+  } | send_mail "$subject"
+}
+
+# Mails the status of each config and its output from this run
+function send_run_mail {
+  local rc=$1 subject id
+  if [ "$rc" -eq 0 ]; then
+    subject="Backup job finished successfully"
+  elif $failures && [ "$rc" -eq 1 ] && [ -z "$active" ]; then
+    subject="Backup job finished with failures"
+  elif $mail_failed && [ "$rc" -eq 1 ] && [ -z "$active" ]; then
+    subject="Backup job finished, but a config mail could not be sent"
+  else
+    subject="Backup job failed unexpectedly"
+  fi
+  {
+    for id in "${selected[@]}"; do
+      echo "$id: ${status[$id]}"
+    done
+    for id in "${selected[@]}"; do
+      if [ -s "$work_dir/$id.out" ]; then
+        echo
+        echo "----- $id -----"
+        output_tail "$id"
+      fi
+    done
+  } | send_mail "$subject"
+}
+
+function run_config {
+  local id=$1 status_file=$work_dir/$1.status rc state
+  active=$id
+  exec > >(tee -a "$work_dir/$id.out")
+  tee_pids+=($!)
+  exec 2> >(tee -a "$work_dir/$id.out" >&2)
+  tee_pids+=($!)
+  # In a subshell, so a failure (die or set -e) ends only this config. set -e must be set
+  # around a plain statement: under if or || bash would ignore it inside the subshell.
+  set +e
+  (
+    set -e
+    process_config "${conf_of[$id]}" "$status_file"
+  )
+  rc=$?
+  set -e
+  state=$(cat "$status_file" 2> /dev/null || true)
+  if [ "$rc" -ne 0 ]; then
+    failures=true
+  fi
+  if [ "$state" = "passed to rsnapshot" ]; then
+    status[$id]="rsnapshot $command rc=$rc"
+  else
+    echo "===== $PROG $id finished $(now) rc=$rc ====="
+    if [ "$rc" -eq 0 ]; then
+      status[$id]=$state
+    else
+      status[$id]="FAILED rc=$rc"
+    fi
+  fi
+  restore_output
+  active=
+  # Mail what ran or failed, and a skipped request; not a command passed to rsnapshot
+  if $email; then
+    case ${status[$id]} in
+      ok | FAILED*) send_config_mail "$id" || mail_failed=true ;;
+      skipped*) if [ "$command" != retry ]; then send_config_mail "$id" || mail_failed=true; fi ;;
+    esac
+  fi
+}
+
+for id in "${selected[@]}"; do
+  run_config "$id"
+done
+if $failures || $mail_failed; then
+  exit 1
+fi
