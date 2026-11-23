@@ -36,7 +36,15 @@ Each rsnapshot config needs:
 ## Installing
 
 ```sh
-sudo install -m 755 rsnapshotx /usr/local/sbin/rsnapshotx
+sudo ./install.sh
+```
+
+This installs `rsnapshotx` into `/usr/local/bin`. Set `PREFIX` to install elsewhere, e.g.
+`sudo PREFIX=/opt/rsnapshotx ./install.sh` installs into `/opt/rsnapshotx/bin`. To install by hand
+instead:
+
+```sh
+sudo install -m 755 rsnapshotx /usr/local/bin/rsnapshotx
 ```
 
 ### Scheduling with cron
@@ -116,7 +124,7 @@ to install rsnapshot:
 sudo rsnapshotx --start-ssh-agent /root/.ssh/id_backup
 sudo docker run --rm -it --init \
   -v /etc/localtime:/etc/localtime:ro \
-  -v /usr/local/sbin/rsnapshotx:/usr/local/sbin/rsnapshotx:ro \
+  -v /usr/local/bin/rsnapshotx:/usr/local/bin/rsnapshotx:ro \
   -v /etc/rsnapshot:/etc/rsnapshot:ro \
   -v /root/.ssh:/root/.ssh \
   -v /backup:/backup \
