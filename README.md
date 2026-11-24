@@ -155,6 +155,38 @@ sudo rsnapshotx -t -c /etc/rsnapshot/laptop.conf daily     # test run: shows wha
 shellcheck rsnapshotx
 ```
 
+## Alternatives Considered
+
+### rsnapshot-once
+
+[rsnapshot-once](https://github.com/binwiederhier/rsnapshot-once) is run often (e.g. hourly) and
+calls rsnapshot only when the newest snapshot of the level is old enough: `daily.0` older than
+23 hours, `weekly.0` older than 6.5 days, `monthly.0` older than 29 days. So `rsnapshot-once daily`
+does not necessarily take a backup, and how rsnapshotx differs:
+
+- the schedule follows the age of the last snapshot, not the calendar, so it drifts: a daily taken
+  late (the host was offline at the usual time) moves the next one, weeklies fall on different
+  weekdays, and monthlies do not follow calendar months. rsnapshotx keeps cron's schedule: a
+  requested level stays pending until it succeeds, however late that is
+- it does not check that the source host is reachable, and leaves that failure to rsnapshot. It
+  is meant to run on the machine being backed up (it waits 15 minutes after boot or resume).
+  rsnapshotx runs on the backup server, and an offline host is not an error
+- it does not wait for the oldest snapshot of the level below before rotating a higher level
+
+### BackupPC
+
+[BackupPC](https://backuppc.github.io/backuppc/) also handles hosts that are only online now and
+then, and it adds a web interface, deduplication across hosts and compression. However, it keeps
+backups in its own pool format: files are stored by content (optionally compressed), and their
+names and attributes are kept in BackupPC's metadata. A backup is therefore not a plain directory
+tree you can browse, `cp` or `rsync` from, and restores go through its web interface or its tools
+(e.g. `BackupPC_tarCreate`). It is also a larger install: a daemon, a web server and their
+configuration.
+
+rsnapshot keeps each snapshot as a plain directory tree, with unchanged files hard-linked between
+snapshots. Any snapshot can be read, copied or rsynced with standard tools, and restoring needs
+neither rsnapshot nor rsnapshotx.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
