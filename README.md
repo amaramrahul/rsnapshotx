@@ -58,19 +58,19 @@ MAILTO=root
 
 # m  h     dom mon dow user command
 # monthly, on the 1st
-5    0     1   *   *   root chronic -v rsnapshotx -c /etc/rsnapshot/laptop.conf monthly
-5    1     1   *   *   root chronic -v rsnapshotx -c /etc/rsnapshot/server.conf monthly
+5    0     1   *   *   root chronic rsnapshotx -c /etc/rsnapshot/laptop.conf monthly
+5    1     1   *   *   root chronic rsnapshotx -c /etc/rsnapshot/server.conf monthly
 
 # weekly, on Sundays
-10   0     *   *   0   root chronic -v rsnapshotx -c /etc/rsnapshot/laptop.conf weekly
-10   1     *   *   0   root chronic -v rsnapshotx -c /etc/rsnapshot/server.conf weekly
+10   0     *   *   0   root chronic rsnapshotx -c /etc/rsnapshot/laptop.conf weekly
+10   1     *   *   0   root chronic rsnapshotx -c /etc/rsnapshot/server.conf weekly
 
 # daily
-15   0     *   *   *   root chronic -v rsnapshotx -c /etc/rsnapshot/laptop.conf daily
-15   1     *   *   *   root chronic -v rsnapshotx -c /etc/rsnapshot/server.conf daily
+15   0     *   *   *   root chronic rsnapshotx -c /etc/rsnapshot/laptop.conf daily
+15   1     *   *   *   root chronic rsnapshotx -c /etc/rsnapshot/server.conf daily
 
 # hourly retry of anything pending, one config after the other
-0    2-23  *   *   *   root chronic -v rsnapshotx -c /etc/rsnapshot/laptop.conf -c /etc/rsnapshot/server.conf retry
+0    2-23  *   *   *   root chronic rsnapshotx -c /etc/rsnapshot/laptop.conf -c /etc/rsnapshot/server.conf retry
 ```
 
 - Each config gets its own hour. Within that hour, monthly is requested before weekly and weekly
